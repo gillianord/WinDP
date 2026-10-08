@@ -1,9 +1,6 @@
-#!/usr/bin/env python
-# coding: utf-8
+"""WinDP library: data models and UI for anemometer processing."""
 
-# In[ ]:
-from . import DMUV
-from . import read_data
-from . import preprocessing
-from . import figures
-from . import notes_tables
+from . import models
+
+# ui is imported explicitly (WinDP_library.ui.app) to avoid pulling Tk widgets
+# into every library import.

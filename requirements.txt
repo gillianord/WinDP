@@ -1,0 +1,16 @@
+# Core scientific stack
+numpy>=1.26
+pandas>=2.1
+matplotlib>=3.8
+
+# Wind rose projection for the main plot
+windrose>=1.9
+
+# Excel read/write (load raw/processed workbooks; export .xlsx)
+openpyxl>=3.1
+xlsxwriter>=3.1
+
+# Magnetic declination and map figure
+pygeomag>=1.1
+pyproj>=3.6
+cartopy>=0.22

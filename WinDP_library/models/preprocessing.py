@@ -43,47 +43,66 @@ def magnetic_correction(t,Easting, Northing, utm_zone = 18, northern_hemisphere 
     import numpy as np
     from datetime import datetime
 
-    lon, lat = utm2lonlat(Easting, Northing,utm_zone = 18, northern_hemisphere = False)
+    lon, lat = utm2lonlat(
+        Easting, Northing, utm_zone=utm_zone, northern_hemisphere=northern_hemisphere
+    )
 
-    geo_mag = GeoMag()
-    
-    #includes leap years
+    # includes leap years
     if t.year % 4 == 0:
-        days_in_year =366
+        days_in_year = 366
     else:
-        days_in_year =365
-            
-    #time in years
-    time = t.year+(t.month-1)/12+(t.day-1)/days_in_year+t.hour/(days_in_year*24)+t.minute/(days_in_year*24*60)
+        days_in_year = 365
+
+    # time in years
+    time = (
+        t.year
+        + (t.month - 1) / 12
+        + (t.day - 1) / days_in_year
+        + t.hour / (days_in_year * 24)
+        + t.minute / (days_in_year * 24 * 60)
+    )
 
     if time < 2025:
         geo_mag = GeoMag(coefficients_file="wmm/WMM_2020.COF")
         model = "WMM-2020"
-    elif time >= 2025:
+    else:
         geo_mag = GeoMag(coefficients_file="wmm/WMM_2025.COF")
         model = "WMM-2025"
-            
+
     result = geo_mag.calculate(glat=lat, glon=lon, alt=0, time=time)
     uncertainty = result.calculate_uncertainty()
     declination = result.d
     error = uncertainty.d
-    
-    fig = magnetic_correction_image(t, declination, error, model, Easting, Northing, utm_zone, northern_hemisphere)
-    
+
+    fig = magnetic_correction_image(
+        t, declination, error, model, Easting, Northing, utm_zone, northern_hemisphere
+    )
+
     return lon, lat, declination, error, fig
-    
+
+
+def _apply_declination_to_directions(df, declination):
+    """Add declination to WD and wrap into [0, 360).
+
+    Uses array math so DatetimeIndex frames are handled correctly (integer
+    label indexing on a datetime Series raises KeyError).
+    """
+    import numpy as np
+
+    wd = np.asarray(df["WD"], dtype=float) + np.asarray(declination, dtype=float)
+    wd = np.round(wd, 2)
+    wd = np.mod(wd, 360.0)
+    df["WD"] = wd
+
+
 def magnetic_correction_wind(df,Easting, Northing, utm_zone=18,northern_hemisphere = False):
     """
     For the midpoint of wind measurement. Takes a dataframe with a datetime index. 
     """
     from pygeomag import GeoMag
-    import pandas as pd
     import numpy as np
-    from datetime import datetime
-    import matplotlib.pyplot as plt
 
     lon, lat = utm2lonlat(Easting, Northing, utm_zone = utm_zone, northern_hemisphere = northern_hemisphere)  
-    geo_mag = GeoMag()
     
     i = int(len(df)/2)
     t = df.index[i]
@@ -107,17 +126,8 @@ def magnetic_correction_wind(df,Easting, Northing, utm_zone=18,northern_hemisphe
     uncertainty = result.calculate_uncertainty()
     declination = result.d
     error = uncertainty.d
-    fig = magnetic_correction_image(t, declination, error, model, Easting, Northing, utm_zone, northern_hemisphere)
 
-    WD = df.WD + declination
-    for i in range(len(df.WD)):
-        WD[i] = np.round(WD[i],2)
-        if WD[i] >= 360:
-            WD[i] = WD[i]-360
-        elif WD[i] <= 0:
-            WD[i] = WD[i]+360
-    df.WD = WD
-    #fig = magnetic_correction_image(t, declination, error, model, lon, lat,utm_zone, H = 5000, W = 200, kilometers_covered = 18)
+    _apply_declination_to_directions(df, declination)
     fig = magnetic_correction_image(t, declination, error, model, Easting, Northing, utm_zone, northern_hemisphere)
 
     return declination, error, lon, lat, fig
@@ -128,11 +138,8 @@ def magnetic_correction_complete(df,Easting, Northing, utm_zone = 18, northern_h
     For every timestamp of the measurement. Takes a dataframe with a datetime index. Returns an array of decilations and a mean error
     """
     from pygeomag import GeoMag
-    import pandas as pd
     import numpy as np
-    from datetime import datetime
-    import matplotlib.pyplot as plt
-    geo_mag = GeoMag()
+
     lon, lat = utm2lonlat(Easting, Northing,utm_zone = utm_zone, northern_hemisphere = northern_hemisphere)    
     declination = []
     error = []
@@ -161,14 +168,7 @@ def magnetic_correction_complete(df,Easting, Northing, utm_zone = 18, northern_h
         
     mean_error = np.mean(error)
     
-    WD = df.WD + declination
-    for i in range(len(df.WD)):
-        WD[i] = np.round(WD[i],2)
-        if WD[i] >= 360:
-            WD[i] = WD[i]-360
-        elif WD[i] <= 0:
-            WD[i] = WD[i]+360
-    df.WD = WD
+    _apply_declination_to_directions(df, declination)
     fig = magnetic_correction_image(t, declination[-1], error[-1], model, Easting, Northing, utm_zone, northern_hemisphere)
 
     return declination, mean_error, lon, lat, fig 
