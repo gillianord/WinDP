@@ -27,7 +27,7 @@ from WinDP_library.models.export import (
     export_raw_data as write_raw_export,
 )
 from WinDP_library.models.figures import _draw_wind_rose, wind_rose_polar_timeseries
-from WinDP_library.models.preprocessing import (
+from WinDP_library.models.magnetic_correction import (
     lonlat2utm,
     magnetic_correction,
     magnetic_correction_complete,

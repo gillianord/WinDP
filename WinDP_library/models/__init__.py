@@ -3,13 +3,13 @@
 from . import direction_correction
 from . import export
 from . import figures
-from . import preprocessing
+from . import magnetic_correction
 from . import read_data
 
 __all__ = [
     "direction_correction",
     "export",
     "figures",
-    "preprocessing",
+    "magnetic_correction",
     "read_data",
 ]
