@@ -221,39 +221,128 @@ def read_processed_export(
     return data, deleted, direction_corrections
 
 
-def influx2df(empresa, center, nowdate):
+RAW_FORMAT_DATE_DEFAULTS = {
+    "excel": "%Y-%m-%d %H:%M:%S",
+    "tab": "%Y-%m-%d %H:%M:%S",
+    "campbell": "%Y-%m-%d %H:%M:%S",
+    "hobo": "%m/%d/%y %I:%M:%S %p",
+}
+
+
+def detect_raw_wind_format(filepath):
     """
-    Downloads the influx database
+    Detect the raw wind file layout.
+
+    Returns one of ``\"excel\"``, ``\"campbell\"``, ``\"hobo\"``, or ``\"tab\"``.
+    Campbell TOA5 is identified from the first line (even when the extension is
+    ``.csv``). Plain ``.csv`` files are treated as HOBO exports.
     """
-    from influxdb_client import InfluxDBClient
-    from datetime import datetime
+    extension = os.path.splitext(filepath)[1].lower()
+    if extension in {".xlsx", ".xls", ".xlsm"}:
+        return "excel"
 
-    org = "org"
-    url = "http://anemoserver:8086"
-    token = "7OS1uxe1XhzmKhsMeh6KUxgFbVBQfUIs6bfsnUb4SME0O4vkeDqcmXQ_dQCLajU6d1Pl2vVJvrWLx1F8mEhtuA=="  # TOKEN LECTURA
+    with open(filepath, "r", encoding="utf-8", errors="replace") as handle:
+        first_line = handle.readline().lstrip("\ufeff").strip()
 
-    client = InfluxDBClient(url=url, token=token, org=org)
+    first_token = first_line.lstrip('"').split(",", 1)[0].strip().strip('"')
+    if first_token.upper() == "TOA5":
+        return "campbell"
+    if extension == ".csv":
+        return "hobo"
+    return "tab"
 
-    # WD DIRECCION // WS_max RACHA // WS VIENTO NORMAL
 
-    query = f'''
-    from(bucket: "P_{empresa}")  
-        |> range(start: 2021-01-01T00:00:00Z, stop: {nowdate.strftime('%Y-%m-%dT%H:%M:%SZ')})
-        |> filter(fn: (r) => r["_measurement"] == "{center}")
-        |> filter(fn: (r) => r["_field"] == "_time" or r["_field"] == "WD" or r["_field"] == "WS" or r["_field"] == "WS_max") 
-        |> pivot(rowKey: ["_time"], columnKey:["_field"], valueColumn:"_value")
-    '''
+def read_raw_wind(path, filename, date_format=None, header=0, raw_format=None):
+    """
+    Load a raw wind file, auto-detecting HOBO / Campbell / Excel / tab text.
 
-    df = client.query_api().query_data_frame(org=org, query=query)
+    When ``date_format`` is omitted, a format-specific default is used.
+    """
+    filepath = os.path.join(path, filename)
+    fmt = raw_format or detect_raw_wind_format(filepath)
+    if date_format is None or not str(date_format).strip():
+        date_format = RAW_FORMAT_DATE_DEFAULTS.get(fmt, "%Y-%m-%d %H:%M:%S")
 
-    date_obj = []
-    for i in range(len(df._time)):
-        date_str = str(df._time[i])
-        date_str = date_str[:-6]
-        date_obj.append(datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S"))
+    if fmt == "hobo":
+        return read_HOBO(path, filename, date_format=date_format)
+    if fmt == "campbell":
+        return read_campbell(path, filename, date_format=date_format)
+    return read_wind_data(path, filename, date_format=date_format, header=header)
 
-    df.index = date_obj
-    df = df.iloc[:, 6:]
-    df.dropna()  # Percent of data missing is based on length of dataset so we don't want to count nans
 
-    return df
+def read_HOBO(path, filename, date_format="%m/%d/%y %I:%M:%S %p"):
+    """
+    Reads HOBO LoggerNet / HOBOware CSV wind exports.
+
+    Expected layout:
+    - Row 1: plot title
+    - Row 2: headers (sample #, timestamp, direction, speed, gust)
+    - Remaining rows: data
+
+    Returns a DataFrame indexed by timestamp with columns WD, WS, WS_max.
+    Rows where both wind speed and gust are 0 have WD, WS, and WS_max set to NaN.
+    """
+    filepath = os.path.join(path, filename)
+    raw = pd.read_csv(filepath, header=1, sep=",", engine="python")
+    if raw.shape[1] < 5:
+        raise ValueError(
+            "HOBO file must have at least 5 columns "
+            "(sample #, timestamp, WD, WS, WS_max)."
+        )
+
+    timestamps = _parse_timestamps(raw.iloc[:, 1], date_format, strict=True)
+    out = pd.DataFrame(
+        {
+            "WD": pd.to_numeric(raw.iloc[:, 2], errors="coerce").to_numpy(),
+            "WS": pd.to_numeric(raw.iloc[:, 3], errors="coerce").to_numpy(),
+            "WS_max": pd.to_numeric(raw.iloc[:, 4], errors="coerce").to_numpy(),
+        },
+        index=timestamps,
+    )
+    return _null_zero_speed_and_gust(out)
+
+
+def read_campbell(path, filename, date_format="%Y-%m-%d %H:%M:%S"):
+    """
+    Reads Campbell Scientific TOA5 table exports (``.dat`` / CSV).
+
+    Expected layout:
+    - Row 1: station metadata (TOA5, ...)
+    - Row 2: column names
+    - Row 3: units
+    - Row 4: processing types (Avg, Max, WVc, ...)
+    - Remaining rows: data
+
+    Renames ``WS_ms_Avg`` → WS, ``WS_ms_Max`` → WS_max, and
+    ``WindDir_D1_WVT`` → WD. Returns WD / WS / WS_max indexed by TIMESTAMP,
+    plus ``BattV`` when that column is present.
+    Rows where both wind speed and gust are 0 have WD, WS, and WS_max set to NaN.
+    """
+    filepath = os.path.join(path, filename)
+    # Skip metadata (row 0), units (row 2), and types (row 3); use names on row 1.
+    raw = pd.read_csv(filepath, skiprows=[0, 2, 3], header=0)
+
+    rename_map = {
+        "WS_ms_Avg": "WS",
+        "WS_ms_Max": "WS_max",
+        "WindDir_D1_WVT": "WD",
+    }
+    raw = raw.rename(columns=rename_map)
+
+    required = ["TIMESTAMP", "WD", "WS", "WS_max"]
+    missing = [name for name in required if name not in raw.columns]
+    if missing:
+        raise ValueError(
+            "Campbell file is missing required column(s): " + ", ".join(missing)
+        )
+
+    timestamps = _parse_timestamps(raw["TIMESTAMP"], date_format, strict=True)
+    frame = {
+        "WD": pd.to_numeric(raw["WD"], errors="coerce").to_numpy(),
+        "WS": pd.to_numeric(raw["WS"], errors="coerce").to_numpy(),
+        "WS_max": pd.to_numeric(raw["WS_max"], errors="coerce").to_numpy(),
+    }
+    if "BattV" in raw.columns:
+        frame["BattV"] = pd.to_numeric(raw["BattV"], errors="coerce").to_numpy()
+    out = pd.DataFrame(frame, index=timestamps)
+    return _null_zero_speed_and_gust(out)

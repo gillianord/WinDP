@@ -35,9 +35,11 @@ from WinDP_library.models.magnetic_correction import (
     utm2lonlat,
 )
 from WinDP_library.models.read_data import (
+    RAW_FORMAT_DATE_DEFAULTS,
+    detect_raw_wind_format,
     ensure_ten_minute_frequency,
     read_processed_export,
-    read_wind_data,
+    read_raw_wind,
 )
 
 
@@ -656,7 +658,9 @@ class WindDataProcessingApp:
             parent=self.root,
             title="Open raw wind data",
             filetypes=[
-                ("Wind data", "*.txt *.dat *.tsv *.xlsx *.xls *.xlsm"),
+                ("Wind data", "*.txt *.dat *.tsv *.csv *.xlsx *.xls *.xlsm"),
+                ("HOBO CSV", "*.csv"),
+                ("Campbell TOA5", "*.dat *.csv"),
                 ("Excel", "*.xlsx *.xls *.xlsm"),
                 ("Text", "*.txt *.dat *.tsv"),
                 ("All files", "*.*"),
@@ -666,27 +670,45 @@ class WindDataProcessingApp:
             return
 
         directory, basename = os.path.split(filename)
-        extension = os.path.splitext(basename)[1].lower()
-        is_tab_text = extension not in {".xlsx", ".xls", ".xlsm"}
-        date_format = self.date_format.get().strip() or "%Y-%m-%d %H:%M:%S"
+        try:
+            raw_format = detect_raw_wind_format(filename)
+        except OSError as exc:
+            messagebox.showerror(
+                "Unable to load wind data",
+                str(exc),
+                parent=self.root,
+            )
+            return
+
+        allows_date_retry = raw_format in {"tab", "hobo", "campbell"}
+        # Use the format-specific default so a prior HOBO load does not leave
+        # Campbell (or tab/Excel) with the wrong timestamp pattern.
+        date_format = RAW_FORMAT_DATE_DEFAULTS.get(
+            raw_format, "%Y-%m-%d %H:%M:%S"
+        )
+        if raw_format in {"tab", "excel"}:
+            stored = self.date_format.get().strip()
+            if stored and stored != RAW_FORMAT_DATE_DEFAULTS["hobo"]:
+                date_format = stored
 
         while True:
             try:
-                data = read_wind_data(
+                data = read_raw_wind(
                     directory,
                     basename,
                     date_format=date_format,
+                    raw_format=raw_format,
                 )
                 self._validate_data(data)
                 break
             except Exception as exc:
-                if is_tab_text and self._is_date_format_error(exc):
+                if allows_date_retry and self._is_date_format_error(exc):
                     new_format = simpledialog.askstring(
                         "Date format",
                         "Timestamps could not be parsed with the current date "
                         f"format:\n{date_format}\n\n"
                         f"{exc}\n\n"
-                        "Enter the date format for this tab-delimited file\n"
+                        "Enter the date format for this file\n"
                         "(example: %d/%m/%Y %H:%M:%S):",
                         initialvalue=date_format,
                         parent=self.root,
@@ -697,7 +719,7 @@ class WindDataProcessingApp:
                     if not new_format:
                         messagebox.showwarning(
                             "Date format",
-                            "A date format is required for tab-delimited files.",
+                            "A date format is required for this file type.",
                             parent=self.root,
                         )
                         return
@@ -712,6 +734,7 @@ class WindDataProcessingApp:
                 )
                 return
 
+        self.date_format.set(date_format)
         center = self._resolve_center_name(basename)
         if center is None:
             return
