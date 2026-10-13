@@ -2,7 +2,7 @@
 Desktop app for processing wind speed and direction data. Includes the WMM Declination Calculator which can be used to apply a magnetic correction to the direction. This is generally done to refer anemometer data installed with a compass to geographic North. A midpoint date is used for the for the simple correction, while the complete correction applies the declination to each timestamp.  
 
 ## Features
-- Load tab-delimited or Excel wind data files
+- Load tab-delimited or Excel wind data files along with Hobo H21-USB and Campbell data logger formats 
 - Interactive wind rose, polar scatter, and time-series plots with point selection
 - Toggle raw (read-only) vs processed views and optional series overlays (gust, battery)
 - Magnetic correction to geographic North via the World Magnetic Model (WMM) through [pygeomag](https://github.com/boxpet/pygeomag).
