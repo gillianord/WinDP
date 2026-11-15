@@ -2,12 +2,18 @@
 # coding: utf-8
 
 import os
+import unicodedata
 from datetime import datetime
 
 import pandas as pd
 
 
 EXCEL_COLUMN_MAP = {
+    # English (current export labels)
+    "Direction (°)": "WD",
+    "Speed (m/s)": "WS",
+    "Gust (m/s)": "WS_max",
+    # Spanish (legacy export labels)
     "Dir. Media [°]": "WD",
     "Vel. media [m/s]": "WS",
     "Racha [m/s]": "WS_max",
@@ -63,14 +69,29 @@ def ensure_ten_minute_frequency(df):
 
 
 def _excel_wind_frame(df, date_format):
-    """Map an exported Excel wind sheet onto WD / WS / WS_max columns."""
-    missing = [name for name in EXCEL_COLUMN_MAP if name not in df.columns]
+    """Map an exported Excel wind sheet onto WD / WS / WS_max columns.
+
+    Accepts either English export labels (``Direction (°)``, ``Speed (m/s)``,
+    ``Gust (m/s)``) or legacy Spanish labels (``Dir. Media [°]``, etc.).
+    """
+    rename = {
+        column: EXCEL_COLUMN_MAP[column]
+        for column in df.columns
+        if column in EXCEL_COLUMN_MAP
+    }
+    out = df.rename(columns=rename)
+    missing = [name for name in ("WD", "WS", "WS_max") if name not in out.columns]
     if missing:
+        expected = (
+            "Direction (°) / Speed (m/s) / Gust (m/s) "
+            "(or legacy Dir. Media [°] / Vel. media [m/s] / Racha [m/s])"
+        )
         raise ValueError(
-            "Excel sheet is missing required column(s): " + ", ".join(missing)
+            "Excel sheet is missing required wind column(s) for "
+            + ", ".join(missing)
+            + f". Expected {expected}."
         )
     timestamps = _parse_timestamps(df.iloc[:, 0], date_format)
-    out = df.rename(columns=EXCEL_COLUMN_MAP)
     out = out.loc[:, ["WD", "WS", "WS_max"]].copy()
     out.index = timestamps
     return out
@@ -96,9 +117,9 @@ def read_wind_data(path, filename, date_format="%Y-%m-%d %H:%M:%S", header=0):
 
     Excel files are expected to use:
     - Column A: timestamp
-    - ``Dir. Media [°]``: wind direction
-    - ``Vel. media [m/s]``: wind speed
-    - ``Racha [m/s]``: wind gust
+    - ``Direction (°)`` (or legacy ``Dir. Media [°]``): wind direction
+    - ``Speed (m/s)`` (or legacy ``Vel. media [m/s]``): wind speed
+    - ``Gust (m/s)`` (or legacy ``Racha [m/s]``): wind gust
 
     Rows where both wind speed and gust are 0 have WD, WS, and WS_max set to NaN.
 
@@ -228,6 +249,16 @@ RAW_FORMAT_DATE_DEFAULTS = {
     "hobo": "%m/%d/%y %I:%M:%S %p",
 }
 
+# HOBOware timestamp patterns vary by language / 12- vs 24-hour clock.
+HOBO_DATE_FORMATS = (
+    "%m/%d/%y %I:%M:%S %p",
+    "%d/%m/%y %H:%M:%S",
+    "%d/%m/%Y %H:%M:%S",
+    "%m/%d/%y %H:%M:%S",
+    "%d/%m/%y %I:%M:%S %p",
+    "%m/%d/%Y %I:%M:%S %p",
+)
+
 
 def detect_raw_wind_format(filepath):
     """
@@ -270,32 +301,123 @@ def read_raw_wind(path, filename, date_format=None, header=0, raw_format=None):
     return read_wind_data(path, filename, date_format=date_format, header=header)
 
 
+def _fold_header(text):
+    """Lowercase a header and strip accents so Spanish labels still match."""
+    folded = unicodedata.normalize("NFKD", str(text).casefold())
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in folded)
+
+
+def _read_csv_with_encoding(filepath, **kwargs):
+    last_error = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(filepath, encoding=encoding, **kwargs)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise last_error
+
+
+def _find_hobo_column(columns, *needles, exclude=()):
+    """Return the first column whose folded header contains all ``needles``."""
+    for column in columns:
+        folded = _fold_header(column)
+        if any(token in folded for token in exclude):
+            continue
+        if all(needle in folded for needle in needles):
+            return column
+    return None
+
+
+def _parse_hobo_timestamps(values, date_format):
+    """Parse HOBO timestamps, trying locale-specific formats if needed."""
+    formats = []
+    for candidate in (date_format,) + HOBO_DATE_FORMATS:
+        if candidate and candidate not in formats:
+            formats.append(candidate)
+    last_error = None
+    for fmt in formats:
+        try:
+            return _parse_timestamps(values, fmt, strict=True)
+        except ValueError as exc:
+            last_error = exc
+    raise last_error
+
+
+def _hobo_required_columns(columns):
+    """Map HOBO export headers onto timestamp / WD / WS / WS_max columns."""
+    timestamp = (
+        _find_hobo_column(columns, "fecha", "tiempo")
+        or _find_hobo_column(columns, "date", "time")
+        or _find_hobo_column(columns, "fecha")
+    )
+    direction = (
+        _find_hobo_column(columns, "direccion", "viento")
+        or _find_hobo_column(columns, "direcci", "viento")
+        or _find_hobo_column(columns, "wind", "direction")
+    )
+    # Gust first: "Velocidad de Ráfagas" must not be taken as mean speed.
+    gust = (
+        _find_hobo_column(columns, "velocidad", "rafagas")
+        or _find_hobo_column(columns, "rafagas")
+        or _find_hobo_column(columns, "gust")
+    )
+    speed = (
+        _find_hobo_column(columns, "velocidad", "viento", exclude=("rafagas", "gust"))
+        or _find_hobo_column(columns, "wind", "speed", exclude=("gust",))
+    )
+
+    missing = []
+    if timestamp is None:
+        missing.append("timestamp (Fecha Tiempo)")
+    if direction is None:
+        missing.append('direction ("Dirección del viento")')
+    if speed is None:
+        missing.append('wind speed ("Velocidad del viento")')
+    if gust is None:
+        missing.append('gust ("Velocidad de Ráfagas")')
+    if missing:
+        available = ", ".join(str(name) for name in columns)
+        raise ValueError(
+            "HOBO file is missing required column(s): "
+            + ", ".join(missing)
+            + f". Found headers: {available}."
+        )
+    return timestamp, direction, speed, gust
+
+
 def read_HOBO(path, filename, date_format="%m/%d/%y %I:%M:%S %p"):
     """
-    Reads HOBO LoggerNet / HOBOware CSV wind exports.
+    Reads HOBO / HOBOware CSV wind exports.
 
     Expected layout:
-    - Row 1: plot title
-    - Row 2: headers (sample #, timestamp, direction, speed, gust)
+    - Row 0: plot / project title
+    - Row 1: headers. Column order is not fixed; names include units and
+      logger/sensor serials. Spanish HOBOware headers are matched by:
+      - ``Dirección del viento`` → WD
+      - ``Velocidad del viento`` → WS
+      - ``Velocidad de Ráfagas`` → WS_max
+      English HOBOware labels (Wind Direction / Wind Speed / Gust) are
+      also accepted.
     - Remaining rows: data
 
     Returns a DataFrame indexed by timestamp with columns WD, WS, WS_max.
     Rows where both wind speed and gust are 0 have WD, WS, and WS_max set to NaN.
     """
     filepath = os.path.join(path, filename)
-    raw = pd.read_csv(filepath, header=1, sep=",", engine="python")
-    if raw.shape[1] < 5:
-        raise ValueError(
-            "HOBO file must have at least 5 columns "
-            "(sample #, timestamp, WD, WS, WS_max)."
-        )
+    raw = _read_csv_with_encoding(
+        filepath, header=1, sep=",", engine="python"
+    )
+    timestamp_col, direction_col, speed_col, gust_col = _hobo_required_columns(
+        raw.columns
+    )
 
-    timestamps = _parse_timestamps(raw.iloc[:, 1], date_format, strict=True)
+    timestamps = _parse_hobo_timestamps(raw[timestamp_col], date_format)
     out = pd.DataFrame(
         {
-            "WD": pd.to_numeric(raw.iloc[:, 2], errors="coerce").to_numpy(),
-            "WS": pd.to_numeric(raw.iloc[:, 3], errors="coerce").to_numpy(),
-            "WS_max": pd.to_numeric(raw.iloc[:, 4], errors="coerce").to_numpy(),
+            "WD": pd.to_numeric(raw[direction_col], errors="coerce").to_numpy(),
+            "WS": pd.to_numeric(raw[speed_col], errors="coerce").to_numpy(),
+            "WS_max": pd.to_numeric(raw[gust_col], errors="coerce").to_numpy(),
         },
         index=timestamps,
     )

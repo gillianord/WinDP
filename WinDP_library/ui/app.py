@@ -23,6 +23,7 @@ from WinDP_library.models.direction_correction import (
     wrap_degrees,
 )
 from WinDP_library.models.export import (
+    EXPORT_WIND_COLUMNS,
     export_processed_data as write_processed_export,
     export_raw_data as write_raw_export,
 )
@@ -814,7 +815,13 @@ class WindDataProcessingApp:
     @staticmethod
     def _center_from_basename(basename: str) -> str | None:
         stem = os.path.splitext(basename)[0]
-        for prefix in ("Datos_Preprocesados_", "Datos_Procesados_"):
+        for prefix in (
+            "preprocessed_wind_data_",
+            "processed_wind_data_",
+            # Legacy Spanish export prefixes
+            "Datos_Preprocesados_",
+            "Datos_Procesados_",
+        ):
             if stem.startswith(prefix):
                 center = stem[len(prefix) :].strip()
                 return center or None
@@ -949,6 +956,13 @@ class WindDataProcessingApp:
 
     @staticmethod
     def _export_columns(data: pd.DataFrame) -> pd.DataFrame:
+        """Build WD / WS / WS_max for Excel export.
+
+        Completely empty timestamps are dropped (for example 10-minute gaps
+        inserted on load). Rows that still have at least one of direction,
+        speed, or gust are kept, including Hobo cases where one sensor failed
+        and the other did not.
+        """
         export_df = pd.DataFrame(index=data.index)
         export_df["WD"] = pd.to_numeric(data["WD"], errors="coerce").round(2)
         export_df["WS"] = pd.to_numeric(data["WS"], errors="coerce").round(3)
@@ -961,7 +975,7 @@ class WindDataProcessingApp:
                 drop_subset.append("WS_max")
         else:
             export_df["WS_max"] = np.nan
-        return export_df.dropna(subset=drop_subset)
+        return export_df.dropna(subset=drop_subset, how="all")
 
     def _deleted_export_frame(self) -> pd.DataFrame | None:
         if self.original_data is None or not self.deleted_row_ids:
@@ -976,7 +990,7 @@ class WindDataProcessingApp:
             index=deleted.index,
         )
         export_df = self._export_columns(deleted)
-        export_df.columns = ["Dir. Media [°]", "Vel. media [m/s]", "Racha [m/s]"]
+        export_df.columns = list(EXPORT_WIND_COLUMNS)
         export_df["Notas"] = notes.reindex(export_df.index).fillna("")
         return export_df
 

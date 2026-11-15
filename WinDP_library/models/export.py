@@ -1,12 +1,16 @@
+# Canonical Excel wind-column labels (also accepted when loading).
+EXPORT_WIND_COLUMNS = ["Direction (°)", "Speed (m/s)", "Gust (m/s)"]
+
+
 def export_raw_data(path, center, df, sheet_name="Datos_Preprocesados"):
     import pandas as pd
     import os
 
     df = df.copy()
-    df.columns = ["Dir. Media [°]", "Vel. media [m/s]", "Racha [m/s]"]
+    df.columns = list(EXPORT_WIND_COLUMNS)
     df.index.name = "Fecha y Hora"
 
-    output_filepath = os.path.join(path, f"Datos_Preprocesados_{center}.xlsx")
+    output_filepath = os.path.join(path, f"preprocessed_wind_data_{center}.xlsx")
 
     with pd.ExcelWriter(output_filepath, engine="xlsxwriter", datetime_format="dd-mm-yyyy HH:MM") as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=True)
@@ -48,10 +52,10 @@ def export_processed_data(
     import os
 
     df = df.copy()
-    df.columns = ["Dir. Media [°]", "Vel. media [m/s]", "Racha [m/s]"]
+    df.columns = list(EXPORT_WIND_COLUMNS)
     df.index.name = "Fecha y Hora"
 
-    output_filepath = os.path.join(path, f"Datos_Procesados_{center}.xlsx")
+    output_filepath = os.path.join(path, f"processed_wind_data_{center}.xlsx")
 
     with pd.ExcelWriter(output_filepath, engine="xlsxwriter", datetime_format="dd-mm-yyyy HH:MM") as writer:
         df.to_excel(writer, sheet_name=sheet_names[0], index=True)
