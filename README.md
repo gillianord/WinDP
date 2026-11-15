@@ -1,10 +1,7 @@
-<<<<<<< HEAD
-=======
 # WinDP — Wind Data Processing
 Desktop app for processing wind speed and direction data. Includes the WMM Declination Calculator which can be used to apply a magnetic correction to the direction. This is generally done to refer anemometer data installed with a compass to geographic North. A midpoint date is used for the for the simple correction, while the complete correction applies the declination to each timestamp.  
 
 <img src="app.png" width="952" height="501">
-
 
 ## Features
 - Load tab-delimited or Excel wind data files along with Hobo H21-USB and Campbell data logger formats 
