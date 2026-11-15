@@ -1,16 +1,16 @@
 # WinDP — Wind Data Processing
-Desktop app for processing wind speed and direction data. Includes the WMM Declination Calculator which can be used to apply a magnetic correction to the direction. This is generally done to refer anemometer data installed with a compass to geographic North. A midpoint date is used for the for the simple correction, while the complete correction applies the declination to each timestamp.  
+Desktop app for processing wind speed and direction data. Includes the WMM Declination Calculator which can be used to apply a magnetic correction to the direction. This is generally done to refer anemometer data installed with a compass to geographic North. 
 
 <img src="app.png" width="952" height="501">
 
 ## Features
 - Load tab-delimited or Excel wind data files along with Hobo H21-USB and Campbell data logger formats 
 - Interactive wind rose, polar scatter, and time-series plots with point selection
-- Toggle raw (read-only) vs processed views and optional series overlays (gust, battery)
-- Magnetic correction to geographic North via the World Magnetic Model (WMM) through [pygeomag](https://github.com/boxpet/pygeomag).
+- Toggle preprocessed (read-only) vs processed views and optional series overlays (gust, battery)
+- Magnetic correction to geographic North via the World Magnetic Model (WMM) through [pygeomag](https://github.com/boxpet/pygeomag). A midpoint date is used for the for the simple correction, while the complete correction applies the declination to each timestamp.  
 - Direction correction for incorrect anemometer orientation, with correction history
 - Manual deletion of outliers with notes and deletion history and option to undo deletions
-- Export raw and processed Excel workbooks (including deleted points and direction corrections that can be reloaded)
+- Export preprocessed and processed Excel workbooks (including preprocessed data, deleted data and magnetic and direction corrections which can be reloaded with the load processed data menu option)
 
 ## Requirements
 - Python 3.10+
@@ -21,9 +21,8 @@ Desktop app for processing wind speed and direction data. Includes the WMM Decli
 
 ## Setup
 ```powershell
-cd "path\to\WinDP"
+cd "path\to\windp"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python WinDP.py
->>>>>>> 5e6051d2ca489a58fe1273c9f209be87a8e0c287
