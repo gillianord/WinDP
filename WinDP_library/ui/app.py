@@ -24,6 +24,7 @@ from WinDP_library.models.direction_correction import (
 )
 from WinDP_library.models.export import (
     EXPORT_WIND_COLUMNS,
+    MAGNETIC_CORRECTION_COLUMNS,
     export_processed_data as write_processed_export,
     export_raw_data as write_raw_export,
 )
@@ -62,6 +63,7 @@ class WindDataProcessingApp:
         self.selected_row_ids: set[int] = set()
         self._selection_focus_id: int | None = None
         self.magnetic_correction_applied = False
+        self.magnetic_correction_df: pd.DataFrame | None = None
         self.lon = None
         self.lat = None
         self.declination = None
@@ -192,9 +194,9 @@ class WindDataProcessingApp:
         ).pack(anchor=tk.W)
         ttk.Radiobutton(
             self.control_panel,
-            text="View raw data (read-only)",
+            text="View preprocessed data (read-only)",
             variable=self.view_store_var,
-            value="raw",
+            value="preprocessed",
             command=self._on_view_store_changed,
         ).pack(anchor=tk.W, pady=(2, 0))
 
@@ -308,12 +310,16 @@ class WindDataProcessingApp:
         menubar = tk.Menu(self.root)
 
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Load raw data", command=self.load_data)
+        file_menu.add_command(
+            label="Load preprocessed data", command=self.load_data
+        )
         file_menu.add_command(
             label="Load processed data", command=self.load_processed_data
         )
         file_menu.add_separator()
-        file_menu.add_command(label="Export raw data", command=self.export_raw_data)
+        file_menu.add_command(
+            label="Export preprocessed data", command=self.export_raw_data
+        )
         file_menu.add_command(
             label="Export processed data", command=self.export_processed_data
         )
@@ -365,9 +371,9 @@ class WindDataProcessingApp:
             command=self._on_view_store_changed,
         )
         view_submenu.add_radiobutton(
-            label="View raw data (read-only)",
+            label="View preprocessed data (read-only)",
             variable=self.view_store_var,
-            value="raw",
+            value="preprocessed",
             command=self._on_view_store_changed,
         )
         control_menu.add_cascade(label="View", menu=view_submenu)
@@ -657,7 +663,7 @@ class WindDataProcessingApp:
     def load_data(self) -> None:
         filename = filedialog.askopenfilename(
             parent=self.root,
-            title="Open raw wind data",
+            title="Open preprocessed wind data",
             filetypes=[
                 ("Wind data", "*.txt *.dat *.tsv *.csv *.xlsx *.xls *.xlsm"),
                 ("HOBO CSV", "*.csv"),
@@ -771,7 +777,13 @@ class WindDataProcessingApp:
 
         directory, basename = os.path.split(filename)
         try:
-            data, deleted, direction_corrections = read_processed_export(
+            (
+                data,
+                deleted,
+                direction_corrections,
+                magnetic_correction,
+                preprocessed,
+            ) = read_processed_export(
                 directory,
                 basename,
                 date_format=self.date_format.get().strip(),
@@ -783,6 +795,8 @@ class WindDataProcessingApp:
             else:
                 combined = data
             self._validate_data(combined)
+            if preprocessed is not None and not preprocessed.empty:
+                self._validate_data(preprocessed)
         except Exception as exc:
             messagebox.showerror(
                 "Unable to load processed data",
@@ -810,6 +824,16 @@ class WindDataProcessingApp:
             magnetic_correction_applied=True,
             deletion_notes_by_time=deletion_notes_by_time,
             direction_corrections=direction_corrections,
+            magnetic_correction_df=(
+                magnetic_correction
+                if magnetic_correction is not None and not magnetic_correction.empty
+                else None
+            ),
+            preprocessed_data=(
+                preprocessed
+                if preprocessed is not None and not preprocessed.empty
+                else None
+            ),
         )
 
     @staticmethod
@@ -860,6 +884,8 @@ class WindDataProcessingApp:
         magnetic_correction_applied: bool,
         deletion_notes_by_time: dict | None = None,
         direction_corrections: pd.DataFrame | None = None,
+        magnetic_correction_df: pd.DataFrame | None = None,
+        preprocessed_data: pd.DataFrame | None = None,
     ) -> None:
         data = data.copy()
         data["WD"] = pd.to_numeric(data["WD"], errors="coerce")
@@ -893,12 +919,43 @@ class WindDataProcessingApp:
 
         observed = int(data["WS"].notna().sum())
         deleted_count = len(self.deleted_row_ids)
-        self.raw_data = data.copy()
+        if preprocessed_data is not None and not preprocessed_data.empty:
+            preprocessed = preprocessed_data.copy()
+            preprocessed["WD"] = pd.to_numeric(preprocessed["WD"], errors="coerce")
+            preprocessed["WS"] = pd.to_numeric(preprocessed["WS"], errors="coerce")
+            if "WS_max" in preprocessed.columns:
+                preprocessed["WS_max"] = pd.to_numeric(
+                    preprocessed["WS_max"], errors="coerce"
+                )
+            else:
+                preprocessed["WS_max"] = np.nan
+            if "BattV" in preprocessed.columns:
+                preprocessed["BattV"] = pd.to_numeric(
+                    preprocessed["BattV"], errors="coerce"
+                )
+            preprocessed = ensure_ten_minute_frequency(preprocessed)
+            preprocessed = preprocessed.reindex(data.index)
+            if "BattV" in data.columns:
+                if "BattV" in preprocessed.columns:
+                    preprocessed["BattV"] = preprocessed["BattV"].combine_first(
+                        data["BattV"]
+                    )
+                else:
+                    preprocessed["BattV"] = data["BattV"]
+            preprocessed[self.ROW_ID_COLUMN] = data[self.ROW_ID_COLUMN].to_numpy()
+            self.raw_data = preprocessed
+        else:
+            self.raw_data = data.copy()
         self.original_data = data
         self.loaded_directory = directory
         self.loaded_basename = basename
         self.center_name = center
         self.magnetic_correction_applied = magnetic_correction_applied
+        self.magnetic_correction_df = (
+            magnetic_correction_df.copy()
+            if magnetic_correction_df is not None and not magnetic_correction_df.empty
+            else None
+        )
         self.lon = None
         self.lat = None
         self.declination = None
@@ -991,8 +1048,21 @@ class WindDataProcessingApp:
         )
         export_df = self._export_columns(deleted)
         export_df.columns = list(EXPORT_WIND_COLUMNS)
-        export_df["Notas"] = notes.reindex(export_df.index).fillna("")
+        export_df["Notes"] = notes.reindex(export_df.index).fillna("")
         return export_df
+
+    def _magnetic_correction_export_frame(self) -> pd.DataFrame | None:
+        if (
+            not self.magnetic_correction_applied
+            or self.magnetic_correction_df is None
+            or self.magnetic_correction_df.empty
+        ):
+            return None
+        export_df = self.magnetic_correction_df.copy()
+        for column in MAGNETIC_CORRECTION_COLUMNS:
+            if column not in export_df.columns:
+                return None
+        return export_df.loc[:, list(MAGNETIC_CORRECTION_COLUMNS)]
 
     def _direction_correction_export_frame(self) -> pd.DataFrame | None:
         if not self.direction_correction_history:
@@ -1013,7 +1083,7 @@ class WindDataProcessingApp:
     def export_raw_data(self) -> None:
         if self.raw_data is None or self.raw_data.empty:
             messagebox.showwarning(
-                "Export raw data",
+                "Export preprocessed data",
                 "Load wind data before exporting.",
                 parent=self.root,
             )
@@ -1023,7 +1093,9 @@ class WindDataProcessingApp:
         if center is None:
             return
 
-        path = self._prompt_export_directory("Select folder for raw data export")
+        path = self._prompt_export_directory(
+            "Select folder for preprocessed data export"
+        )
         if path is None:
             return
 
@@ -1033,15 +1105,15 @@ class WindDataProcessingApp:
             )
         except Exception as exc:
             messagebox.showerror(
-                "Export raw data",
+                "Export preprocessed data",
                 str(exc),
                 parent=self.root,
             )
             return
 
         messagebox.showinfo(
-            "Export raw data",
-            f"Raw data exported to:\n{output_filepath}",
+            "Export preprocessed data",
+            f"Preprocessed data exported to:\n{output_filepath}",
             parent=self.root,
         )
 
@@ -1069,6 +1141,12 @@ class WindDataProcessingApp:
                 self._processed_export_frame(),
                 deleted_df=self._deleted_export_frame(),
                 direction_correction_df=self._direction_correction_export_frame(),
+                magnetic_correction_df=self._magnetic_correction_export_frame(),
+                preprocessed_df=(
+                    self._export_columns(self.raw_data)
+                    if self.raw_data is not None and not self.raw_data.empty
+                    else None
+                ),
             )
         except Exception as exc:
             messagebox.showerror(
@@ -1133,7 +1211,7 @@ class WindDataProcessingApp:
             )
 
     def _is_raw_view(self) -> bool:
-        return self.view_store_var.get() == "raw"
+        return self.view_store_var.get() == "preprocessed"
 
     def _on_view_store_changed(self) -> None:
         self._rebuild_plot(preferred_row_ids=set(self.selected_row_ids))
@@ -3319,6 +3397,9 @@ class WindDataProcessingApp:
             return
 
         correction_type = self.correction_type_var.get()
+        original_direction = pd.to_numeric(
+            self.original_data["WD"], errors="coerce"
+        ).copy()
         try:
             if correction_type == "complete":
                 declination, error, lon, lat, fig = magnetic_correction_complete(
@@ -3337,6 +3418,24 @@ class WindDataProcessingApp:
                 parent=self.popup1,
             )
             return
+
+        declination_values = np.asarray(declination, dtype=float)
+        if declination_values.ndim == 0 or declination_values.size == 1:
+            declination_series = pd.Series(
+                float(declination_values.reshape(-1)[0]),
+                index=self.original_data.index,
+            )
+        else:
+            declination_series = pd.Series(
+                declination_values, index=self.original_data.index
+            )
+        self.magnetic_correction_df = pd.DataFrame(
+            {
+                "Original Direction (°)": original_direction.round(2),
+                "Declination (°)": declination_series.round(4),
+            },
+            index=self.original_data.index,
+        )
 
         self.magnetic_correction_applied = True
         self.apply_button.state(["disabled"])

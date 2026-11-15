@@ -139,28 +139,49 @@ def read_wind_data(path, filename, date_format="%Y-%m-%d %H:%M:%S", header=0):
     return _null_zero_speed_and_gust(df)
 
 
+def _resolve_sheet_name(sheet_lookup, *candidates):
+    """Return the workbook sheet matching the first known candidate name."""
+    for candidate in candidates:
+        key = candidate.casefold()
+        if key in sheet_lookup:
+            return sheet_lookup[key]
+    return None
+
+
 def read_processed_export(
     path,
     filename,
     date_format="%Y-%m-%d %H:%M:%S",
-    processed_sheet="Datos_procesados",
-    deleted_sheet="Datos_eliminados",
-    direction_correction_sheet="Correccion_direccion",
+    processed_sheet="processed_data",
+    deleted_sheet="deleted_data",
+    direction_correction_sheet="direction_corrections",
+    magnetic_correction_sheet="magnetic_correction",
+    preprocessed_sheet="preprocessed_data",
     header=0,
 ):
     """
     Load a workbook written by ``export_processed_data``.
 
+    Sheet names default to the current English export labels and also accept the
+    legacy Spanish names (``Datos_procesados``, ``Datos_eliminados``,
+    ``Correccion_direccion``).
+
     Returns
     -------
     data : pandas.DataFrame
-        Rows from ``Datos_procesados`` (WD / WS / WS_max).
+        Rows from the processed sheet (WD / WS / WS_max).
     deleted : pandas.DataFrame
-        Rows from ``Datos_eliminados`` with WD / WS / WS_max and a ``Notes``
+        Rows from the deleted sheet with WD / WS / WS_max and a ``Notes``
         column. Empty when that sheet is absent.
     direction_corrections : pandas.DataFrame
-        Rows from ``Correccion_direccion`` when present; otherwise empty with the
-        expected columns.
+        Rows from the direction-corrections sheet when present; otherwise empty
+        with the expected columns.
+    magnetic_correction : pandas.DataFrame
+        Rows from ``magnetic_correction`` when present (original direction and
+        declination); otherwise empty with the expected columns.
+    preprocessed : pandas.DataFrame
+        Rows from ``preprocessed_data`` when present; otherwise empty with the
+        expected wind columns.
     """
     filepath = os.path.join(path, filename)
     extension = os.path.splitext(filename)[1].lower()
@@ -169,30 +190,46 @@ def read_processed_export(
 
     workbook = pd.ExcelFile(filepath)
     sheet_lookup = {name.casefold(): name for name in workbook.sheet_names}
-    processed_key = processed_sheet.casefold()
-    if processed_key not in sheet_lookup:
+    processed_name = _resolve_sheet_name(
+        sheet_lookup, processed_sheet, "Datos_procesados"
+    )
+    if processed_name is None:
         raise ValueError(
             f"Workbook is missing required sheet '{processed_sheet}'."
         )
 
     data = _excel_wind_frame(
-        pd.read_excel(
-            workbook, sheet_name=sheet_lookup[processed_key], header=header
-        ),
+        pd.read_excel(workbook, sheet_name=processed_name, header=header),
         date_format,
     )
 
-    deleted_key = deleted_sheet.casefold()
-    if deleted_key not in sheet_lookup:
+    preprocessed_name = _resolve_sheet_name(
+        sheet_lookup, preprocessed_sheet, "Datos_Preprocesados"
+    )
+    if preprocessed_name is None:
+        preprocessed = pd.DataFrame(columns=["WD", "WS", "WS_max"])
+        preprocessed.index = pd.DatetimeIndex([], name="Timestamp")
+    else:
+        preprocessed = _excel_wind_frame(
+            pd.read_excel(
+                workbook, sheet_name=preprocessed_name, header=header
+            ),
+            date_format,
+        )
+
+    deleted_name = _resolve_sheet_name(
+        sheet_lookup, deleted_sheet, "Datos_eliminados"
+    )
+    if deleted_name is None:
         deleted = pd.DataFrame(columns=["WD", "WS", "WS_max", "Notes"])
-        deleted.index = pd.DatetimeIndex([], name="Fecha y Hora")
+        deleted.index = pd.DatetimeIndex([], name="Timestamp")
     else:
         deleted_raw = pd.read_excel(
-            workbook, sheet_name=sheet_lookup[deleted_key], header=header
+            workbook, sheet_name=deleted_name, header=header
         )
         if deleted_raw.empty:
             deleted = pd.DataFrame(columns=["WD", "WS", "WS_max", "Notes"])
-            deleted.index = pd.DatetimeIndex([], name="Fecha y Hora")
+            deleted.index = pd.DatetimeIndex([], name="Timestamp")
         else:
             deleted = _excel_wind_frame(deleted_raw, date_format)
             if "Notas" in deleted_raw.columns:
@@ -213,12 +250,16 @@ def read_processed_export(
         "Incorrect end",
         "Rotation [°]",
     ]
-    corr_key = direction_correction_sheet.casefold()
-    if corr_key not in sheet_lookup:
+    corr_name = _resolve_sheet_name(
+        sheet_lookup,
+        direction_correction_sheet,
+        "Correccion_direccion",
+    )
+    if corr_name is None:
         direction_corrections = pd.DataFrame(columns=corr_columns)
     else:
         direction_corrections = pd.read_excel(
-            workbook, sheet_name=sheet_lookup[corr_key], header=header
+            workbook, sheet_name=corr_name, header=header
         )
         rename = {}
         for column in direction_corrections.columns:
@@ -239,7 +280,50 @@ def read_processed_export(
                 direction_corrections[column] = pd.NA
         direction_corrections = direction_corrections.loc[:, corr_columns].copy()
 
-    return data, deleted, direction_corrections
+    magnetic_columns = ["Original Direction (°)", "Declination (°)"]
+    magnetic_name = _resolve_sheet_name(
+        sheet_lookup, magnetic_correction_sheet
+    )
+    if magnetic_name is None:
+        magnetic_correction = pd.DataFrame(columns=magnetic_columns)
+        magnetic_correction.index = pd.DatetimeIndex([], name="Timestamp")
+    else:
+        magnetic_raw = pd.read_excel(
+            workbook, sheet_name=magnetic_name, header=header
+        )
+        if magnetic_raw.empty:
+            magnetic_correction = pd.DataFrame(columns=magnetic_columns)
+            magnetic_correction.index = pd.DatetimeIndex([], name="Timestamp")
+        else:
+            rename = {}
+            for column in magnetic_raw.columns:
+                key = str(column).strip().casefold()
+                if key in {
+                    "original direction (°)",
+                    "original direction",
+                    "original wd",
+                }:
+                    rename[column] = "Original Direction (°)"
+                elif key in {"declination (°)", "declination"}:
+                    rename[column] = "Declination (°)"
+            magnetic_frame = magnetic_raw.rename(columns=rename)
+            for column in magnetic_columns:
+                if column not in magnetic_frame.columns:
+                    raise ValueError(
+                        "magnetic_correction sheet is missing required "
+                        f"column '{column}'."
+                    )
+            timestamps = _parse_timestamps(magnetic_raw.iloc[:, 0], date_format)
+            magnetic_correction = magnetic_frame.loc[:, magnetic_columns].copy()
+            magnetic_correction["Original Direction (°)"] = pd.to_numeric(
+                magnetic_correction["Original Direction (°)"], errors="coerce"
+            )
+            magnetic_correction["Declination (°)"] = pd.to_numeric(
+                magnetic_correction["Declination (°)"], errors="coerce"
+            )
+            magnetic_correction.index = pd.DatetimeIndex(timestamps, name="Timestamp")
+
+    return data, deleted, direction_corrections, magnetic_correction, preprocessed
 
 
 RAW_FORMAT_DATE_DEFAULTS = {
