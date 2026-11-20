@@ -8,18 +8,6 @@ from datetime import datetime
 import pandas as pd
 
 
-EXCEL_COLUMN_MAP = {
-    # English (current export labels)
-    "Direction (°)": "WD",
-    "Speed (m/s)": "WS",
-    "Gust (m/s)": "WS_max",
-    # Spanish (legacy export labels)
-    "Dir. Media [°]": "WD",
-    "Vel. media [m/s]": "WS",
-    "Racha [m/s]": "WS_max",
-}
-
-
 def _parse_timestamps(values, date_format, *, strict=False):
     """Parse a timestamp column that may contain strings or Excel datetimes.
 
@@ -52,48 +40,178 @@ def _parse_timestamps(values, date_format, *, strict=False):
     return date_obj
 
 
-def ensure_ten_minute_frequency(df):
+def detect_time_step(index):
     """
-    Reindex onto a regular 10-minute timeline.
+    Infer the dominant sampling interval from a DatetimeIndex.
 
-    Existing timestamps are rounded to the nearest 10 minutes, duplicates are
-    dropped, and missing intervals are inserted as NaN via ``asfreq``.
+    Uses the median positive gap between consecutive timestamps so occasional
+    missing records do not inflate the detected step.
+    """
+    if not isinstance(index, pd.DatetimeIndex):
+        index = pd.DatetimeIndex(pd.to_datetime(index))
+    if len(index) < 2:
+        return pd.Timedelta(minutes=10)
+    diffs = pd.Series(index).diff().dropna()
+    diffs = diffs[diffs > pd.Timedelta(0)]
+    if diffs.empty:
+        return pd.Timedelta(minutes=10)
+    step = diffs.median()
+    # Snap sub-second jitter to whole seconds when the series is second-aligned.
+    if step >= pd.Timedelta(seconds=1):
+        step = pd.Timedelta(seconds=max(1, int(round(step.total_seconds()))))
+    return step
+
+
+def ensure_regular_frequency(df):
+    """
+    Reindex onto a regular timeline at the detected sampling interval.
+
+    Duplicates are dropped and missing intervals between the first and last
+    timestamp are inserted as NaN rows.
     """
     out = df.copy()
     if not isinstance(out.index, pd.DatetimeIndex):
         out.index = pd.to_datetime(out.index)
     out = out.sort_index()
-    out.index = out.index.round("10min")
     out = out[~out.index.duplicated(keep="first")]
-    return out.asfreq("10min")
+    if len(out) < 2:
+        return out
+    step = detect_time_step(out.index)
+    full_index = pd.date_range(start=out.index[0], end=out.index[-1], freq=step)
+    return out.reindex(full_index)
 
 
-def _excel_wind_frame(df, date_format):
-    """Map an exported Excel wind sheet onto WD / WS / WS_max columns.
+# Backwards-compatible alias used by older call sites / notebooks.
+ensure_ten_minute_frequency = ensure_regular_frequency
 
-    Accepts either English export labels (``Direction (°)``, ``Speed (m/s)``,
-    ``Gust (m/s)``) or legacy Spanish labels (``Dir. Media [°]``, etc.).
+
+def _fold_header(text):
+    """Lowercase a header and strip accents so Spanish labels still match."""
+    folded = unicodedata.normalize("NFKD", str(text).casefold())
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in folded)
+
+
+def _header_compact(text):
+    """Folded header with spaces removed for token checks like WD / WS / WS_max."""
+    return "".join(_fold_header(text).split())
+
+
+def _is_gust_header(column):
+    """True when a header looks like wind gust (optional column)."""
+    folded = _fold_header(column)
+    compact = _header_compact(column)
+    return (
+        "gust" in folded
+        or "racha" in folded
+        or "rafagas" in folded
+        or "ws_max" in compact
+        or compact.endswith("wsmax")
+        or compact == "wsmax"
+    )
+
+
+def _is_direction_header(column):
+    """True when a header looks like wind direction (dir / WD / °)."""
+    folded = _fold_header(column)
+    compact = _header_compact(column)
+    if "dir" in folded or "wd" in compact:
+        return True
+    raw = str(column)
+    raw_fold = raw.casefold()
+    # Match a bare degree symbol, but skip temperature-style ``°C`` headers.
+    if "°" not in raw and "º" not in raw:
+        return False
+    if "°c" in raw_fold or "ºc" in raw_fold or "temp" in folded:
+        return False
+    return True
+
+
+def _is_speed_header(column):
+    """True when a header looks like mean wind speed (Speed / Vel / m/s / WS)."""
+    if _is_gust_header(column):
+        return False
+    raw = str(column).casefold()
+    folded = _fold_header(column)
+    compact = _header_compact(column)
+    if "speed" in folded or "vel" in folded:
+        return True
+    if "m/s" in raw or " m s" in f" {folded} ":
+        # Avoid treating direction columns that only carry a degree symbol as speed.
+        if "dir" in folded or "wd" in compact:
+            return False
+        return True
+    # Whole-token / prefix WS (WS, WS_ms_Avg) but not WS_max (handled as gust).
+    return compact == "ws" or (
+        compact.startswith("ws") and not compact.startswith("wsmax")
+    )
+
+
+def _is_strong_direction_header(column):
+    """Direction match via ``dir`` / ``WD`` (preferred over a bare ``°``)."""
+    folded = _fold_header(column)
+    compact = _header_compact(column)
+    return "dir" in folded or "wd" in compact
+
+
+def _find_wind_columns(columns, *, skip=()):
     """
-    rename = {
-        column: EXCEL_COLUMN_MAP[column]
-        for column in df.columns
-        if column in EXCEL_COLUMN_MAP
-    }
-    out = df.rename(columns=rename)
-    missing = [name for name in ("WD", "WS", "WS_max") if name not in out.columns]
+    Locate direction / speed / optional gust columns by flexible header matching.
+
+    Direction: label contains ``dir`` / ``WD`` / ``°``.
+    Speed: label contains ``Speed`` / ``Vel`` / ``m/s`` / ``WS``.
+    Gust (optional): label contains ``Gust`` / ``Racha`` / ``WS_max``.
+    """
+    candidates = [column for column in columns if column not in skip]
+    gust = next((column for column in candidates if _is_gust_header(column)), None)
+    remaining = [column for column in candidates if column != gust]
+    direction = next(
+        (column for column in remaining if _is_strong_direction_header(column)), None
+    )
+    if direction is None:
+        direction = next(
+            (column for column in remaining if _is_direction_header(column)), None
+        )
+    remaining = [column for column in remaining if column != direction]
+    speed = next((column for column in remaining if _is_speed_header(column)), None)
+    return direction, speed, gust
+
+
+def _excel_wind_frame(df, date_format, *, strict_timestamps=False):
+    """Map a wind sheet onto WD / WS / optional WS_max columns.
+
+    Column labels are matched flexibly (English / Spanish / short codes), e.g.
+    ``Direction (°)``, ``Dir. Media [°]``, ``WD`` for direction; ``Speed (m/s)``,
+    ``Vel. media``, ``WS`` for speed; ``Gust``, ``Racha``, ``WS_max`` for gust.
+    Gust is optional when that column is absent.
+    """
+    timestamp_column = df.columns[0]
+    direction_col, speed_col, gust_col = _find_wind_columns(
+        df.columns, skip=(timestamp_column,)
+    )
+    missing = []
+    if direction_col is None:
+        missing.append("direction (label containing dir / WD / °)")
+    if speed_col is None:
+        missing.append("speed (label containing Speed / Vel / m/s / WS)")
     if missing:
-        expected = (
-            "Direction (°) / Speed (m/s) / Gust (m/s) "
-            "(or legacy Dir. Media [°] / Vel. media [m/s] / Racha [m/s])"
-        )
+        available = ", ".join(str(name) for name in df.columns)
         raise ValueError(
-            "Excel sheet is missing required wind column(s) for "
+            "Excel sheet is missing required wind column(s): "
             + ", ".join(missing)
-            + f". Expected {expected}."
+            + f". Found headers: {available}."
         )
-    timestamps = _parse_timestamps(df.iloc[:, 0], date_format)
-    out = out.loc[:, ["WD", "WS", "WS_max"]].copy()
-    out.index = timestamps
+
+    timestamps = _parse_timestamps(
+        df.iloc[:, 0], date_format, strict=strict_timestamps
+    )
+    frame = {
+        "WD": pd.to_numeric(df[direction_col], errors="coerce").to_numpy(),
+        "WS": pd.to_numeric(df[speed_col], errors="coerce").to_numpy(),
+    }
+    if gust_col is not None:
+        frame["WS_max"] = pd.to_numeric(df[gust_col], errors="coerce").to_numpy()
+    out = pd.DataFrame(frame, index=timestamps)
     return out
 
 
@@ -115,11 +233,10 @@ def read_wind_data(path, filename, date_format="%Y-%m-%d %H:%M:%S", header=0):
     """
     Reads wind direction and velocity from a tab-delimited text file or Excel workbook.
 
-    Excel files are expected to use:
-    - Column A: timestamp
-    - ``Direction (°)`` (or legacy ``Dir. Media [°]``): wind direction
-    - ``Speed (m/s)`` (or legacy ``Vel. media [m/s]``): wind speed
-    - ``Gust (m/s)`` (or legacy ``Racha [m/s]``): wind gust
+    Column A is the timestamp. Remaining headers are matched flexibly:
+    - Direction: label contains ``dir`` / ``WD`` / ``°``
+    - Speed: label contains ``Speed`` / ``Vel`` / ``m/s`` / ``WS``
+    - Gust (optional): label contains ``Gust`` / ``Racha`` / ``WS_max``
 
     Rows where both wind speed and gust are 0 have WD, WS, and WS_max set to NaN.
 
@@ -133,10 +250,9 @@ def read_wind_data(path, filename, date_format="%Y-%m-%d %H:%M:%S", header=0):
         return _null_zero_speed_and_gust(_excel_wind_frame(df, date_format))
 
     df = pd.read_csv(filepath, header=header, sep="\t", engine="python")
-    timestamps = _parse_timestamps(df.iloc[:, 0], date_format, strict=True)
-    df.index = timestamps
-    df = df.iloc[:, 1:]
-    return _null_zero_speed_and_gust(df)
+    return _null_zero_speed_and_gust(
+        _excel_wind_frame(df, date_format, strict_timestamps=True)
+    )
 
 
 def _resolve_sheet_name(sheet_lookup, *candidates):
@@ -385,13 +501,6 @@ def read_raw_wind(path, filename, date_format=None, header=0, raw_format=None):
     return read_wind_data(path, filename, date_format=date_format, header=header)
 
 
-def _fold_header(text):
-    """Lowercase a header and strip accents so Spanish labels still match."""
-    folded = unicodedata.normalize("NFKD", str(text).casefold())
-    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
-    return "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in folded)
-
-
 def _read_csv_with_encoding(filepath, **kwargs):
     last_error = None
     for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
@@ -429,18 +538,18 @@ def _parse_hobo_timestamps(values, date_format):
 
 
 def _hobo_required_columns(columns):
-    """Map HOBO export headers onto timestamp / WD / WS / WS_max columns."""
+    """Map HOBO export headers onto timestamp / WD / WS / optional WS_max."""
     timestamp = (
         _find_hobo_column(columns, "fecha", "tiempo")
         or _find_hobo_column(columns, "date", "time")
         or _find_hobo_column(columns, "fecha")
     )
+    # Prefer HOBO-specific labels, then the shared flexible matcher.
     direction = (
         _find_hobo_column(columns, "direccion", "viento")
         or _find_hobo_column(columns, "direcci", "viento")
         or _find_hobo_column(columns, "wind", "direction")
     )
-    # Gust first: "Velocidad de Ráfagas" must not be taken as mean speed.
     gust = (
         _find_hobo_column(columns, "velocidad", "rafagas")
         or _find_hobo_column(columns, "rafagas")
@@ -450,6 +559,13 @@ def _hobo_required_columns(columns):
         _find_hobo_column(columns, "velocidad", "viento", exclude=("rafagas", "gust"))
         or _find_hobo_column(columns, "wind", "speed", exclude=("gust",))
     )
+    if direction is None or speed is None or gust is None:
+        flex_direction, flex_speed, flex_gust = _find_wind_columns(
+            columns, skip=() if timestamp is None else (timestamp,)
+        )
+        direction = direction or flex_direction
+        speed = speed or flex_speed
+        gust = gust or flex_gust
 
     missing = []
     if timestamp is None:
@@ -458,8 +574,6 @@ def _hobo_required_columns(columns):
         missing.append('direction ("Dirección del viento")')
     if speed is None:
         missing.append('wind speed ("Velocidad del viento")')
-    if gust is None:
-        missing.append('gust ("Velocidad de Ráfagas")')
     if missing:
         available = ", ".join(str(name) for name in columns)
         raise ValueError(
@@ -480,12 +594,13 @@ def read_HOBO(path, filename, date_format="%m/%d/%y %I:%M:%S %p"):
       logger/sensor serials. Spanish HOBOware headers are matched by:
       - ``Dirección del viento`` → WD
       - ``Velocidad del viento`` → WS
-      - ``Velocidad de Ráfagas`` → WS_max
+      - ``Velocidad de Ráfagas`` → WS_max (optional)
       English HOBOware labels (Wind Direction / Wind Speed / Gust) are
       also accepted.
     - Remaining rows: data
 
-    Returns a DataFrame indexed by timestamp with columns WD, WS, WS_max.
+    Returns a DataFrame indexed by timestamp with columns WD, WS, and WS_max
+    when a gust column is present.
     Rows where both wind speed and gust are 0 have WD, WS, and WS_max set to NaN.
     """
     filepath = os.path.join(path, filename)
@@ -497,14 +612,13 @@ def read_HOBO(path, filename, date_format="%m/%d/%y %I:%M:%S %p"):
     )
 
     timestamps = _parse_hobo_timestamps(raw[timestamp_col], date_format)
-    out = pd.DataFrame(
-        {
-            "WD": pd.to_numeric(raw[direction_col], errors="coerce").to_numpy(),
-            "WS": pd.to_numeric(raw[speed_col], errors="coerce").to_numpy(),
-            "WS_max": pd.to_numeric(raw[gust_col], errors="coerce").to_numpy(),
-        },
-        index=timestamps,
-    )
+    frame = {
+        "WD": pd.to_numeric(raw[direction_col], errors="coerce").to_numpy(),
+        "WS": pd.to_numeric(raw[speed_col], errors="coerce").to_numpy(),
+    }
+    if gust_col is not None:
+        frame["WS_max"] = pd.to_numeric(raw[gust_col], errors="coerce").to_numpy()
+    out = pd.DataFrame(frame, index=timestamps)
     return _null_zero_speed_and_gust(out)
 
 
@@ -520,8 +634,9 @@ def read_campbell(path, filename, date_format="%Y-%m-%d %H:%M:%S"):
     - Remaining rows: data
 
     Renames ``WS_ms_Avg`` → WS, ``WS_ms_Max`` → WS_max, and
-    ``WindDir_D1_WVT`` → WD. Returns WD / WS / WS_max indexed by TIMESTAMP,
-    plus ``BattV`` when that column is present.
+    ``WindDir_D1_WVT`` → WD, then falls back to flexible header matching.
+    Returns WD / WS / optional WS_max indexed by TIMESTAMP, plus ``BattV``
+    when that column is present.
     Rows where both wind speed and gust are 0 have WD, WS, and WS_max set to NaN.
     """
     filepath = os.path.join(path, filename)
@@ -535,8 +650,23 @@ def read_campbell(path, filename, date_format="%Y-%m-%d %H:%M:%S"):
     }
     raw = raw.rename(columns=rename_map)
 
-    required = ["TIMESTAMP", "WD", "WS", "WS_max"]
-    missing = [name for name in required if name not in raw.columns]
+    if "TIMESTAMP" not in raw.columns:
+        raise ValueError("Campbell file is missing required column(s): TIMESTAMP")
+
+    if "WD" not in raw.columns or "WS" not in raw.columns:
+        direction_col, speed_col, gust_col = _find_wind_columns(
+            raw.columns, skip=("TIMESTAMP",)
+        )
+        rename = {}
+        if direction_col is not None and "WD" not in raw.columns:
+            rename[direction_col] = "WD"
+        if speed_col is not None and "WS" not in raw.columns:
+            rename[speed_col] = "WS"
+        if gust_col is not None and "WS_max" not in raw.columns:
+            rename[gust_col] = "WS_max"
+        raw = raw.rename(columns=rename)
+
+    missing = [name for name in ("WD", "WS") if name not in raw.columns]
     if missing:
         raise ValueError(
             "Campbell file is missing required column(s): " + ", ".join(missing)
@@ -546,8 +676,9 @@ def read_campbell(path, filename, date_format="%Y-%m-%d %H:%M:%S"):
     frame = {
         "WD": pd.to_numeric(raw["WD"], errors="coerce").to_numpy(),
         "WS": pd.to_numeric(raw["WS"], errors="coerce").to_numpy(),
-        "WS_max": pd.to_numeric(raw["WS_max"], errors="coerce").to_numpy(),
     }
+    if "WS_max" in raw.columns:
+        frame["WS_max"] = pd.to_numeric(raw["WS_max"], errors="coerce").to_numpy()
     if "BattV" in raw.columns:
         frame["BattV"] = pd.to_numeric(raw["BattV"], errors="coerce").to_numpy()
     out = pd.DataFrame(frame, index=timestamps)

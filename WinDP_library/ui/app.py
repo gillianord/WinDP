@@ -39,7 +39,7 @@ from WinDP_library.models.magnetic_correction import (
 from WinDP_library.models.read_data import (
     RAW_FORMAT_DATE_DEFAULTS,
     detect_raw_wind_format,
-    ensure_ten_minute_frequency,
+    ensure_regular_frequency,
     read_processed_export,
     read_raw_wind,
 )
@@ -789,7 +789,12 @@ class WindDataProcessingApp:
                 date_format=self.date_format.get().strip(),
             )
             if not deleted.empty:
-                deleted_values = deleted.loc[:, ["WD", "WS", "WS_max"]]
+                deleted_cols = [
+                    column
+                    for column in ("WD", "WS", "WS_max")
+                    if column in deleted.columns
+                ]
+                deleted_values = deleted.loc[:, deleted_cols]
                 combined = pd.concat([data, deleted_values])
                 combined = combined[~combined.index.duplicated(keep="first")]
             else:
@@ -808,7 +813,7 @@ class WindDataProcessingApp:
         deletion_notes_by_time = None
         if not deleted.empty:
             deletion_notes_by_time = {
-                pd.Timestamp(timestamp).round("10min"): note
+                pd.Timestamp(timestamp): note
                 for timestamp, note in deleted["Notes"].items()
             }
 
@@ -896,7 +901,7 @@ class WindDataProcessingApp:
             data["WS_max"] = np.nan
         if "BattV" in data.columns:
             data["BattV"] = pd.to_numeric(data["BattV"], errors="coerce")
-        data = ensure_ten_minute_frequency(data)
+        data = ensure_regular_frequency(data)
         data[self.ROW_ID_COLUMN] = np.arange(len(data), dtype=int)
 
         self.deleted_row_ids.clear()
@@ -933,7 +938,7 @@ class WindDataProcessingApp:
                 preprocessed["BattV"] = pd.to_numeric(
                     preprocessed["BattV"], errors="coerce"
                 )
-            preprocessed = ensure_ten_minute_frequency(preprocessed)
+            preprocessed = ensure_regular_frequency(preprocessed)
             preprocessed = preprocessed.reindex(data.index)
             if "BattV" in data.columns:
                 if "BattV" in preprocessed.columns:
@@ -1015,9 +1020,9 @@ class WindDataProcessingApp:
     def _export_columns(data: pd.DataFrame) -> pd.DataFrame:
         """Build WD / WS / WS_max for Excel export.
 
-        Completely empty timestamps are dropped (for example 10-minute gaps
-        inserted on load). Rows that still have at least one of direction,
-        speed, or gust are kept, including Hobo cases where one sensor failed
+        Completely empty timestamps are dropped (for example gaps inserted on
+        load to keep a regular time step). Rows that still have at least one of
+        direction, speed, or gust are kept, including Hobo cases where one sensor failed
         and the other did not.
         """
         export_df = pd.DataFrame(index=data.index)
